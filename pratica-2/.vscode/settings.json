@@ -3,7 +3,7 @@
   "idf.openOcdConfigs": [
     "board/esp32-wrover-kit-3.3v.cfg"
   ],
-  "idf.portWin": "detect",
+  "idf.portWin": "COM9",
   "idf.currentSetup": "C:\\Users\\sistemembarcados\\esp\\v5.5.1\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
@@ -13,5 +13,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\sistemembarcados\\Desktop\\sistemas-embarcados-2026\\pratica-2\\build"
-  ]
+  ],
+  "idf.flashType": "UART"
 }
