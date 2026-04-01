@@ -17,7 +17,7 @@
 #define GPIO_INPUT_IO_22   (22)
 #define GPIO_INPUT_IO_23   (23)
 
-#define GPIO_OUTPUT_IO_2   (2)
+#define GPIO_OUTPUT_IO_2   (GPIO_NUM_2)
 
 #define GPIO_INPUT_PIN_SEL (( 1ULL << GPIO_INPUT_IO_21 ) | \
                             ( 1ULL << GPIO_INPUT_IO_22 ) | \
@@ -58,7 +58,7 @@ static void IRAM_ATTR gpio_handle(void* arg)
     uint32_t gpio_num = (uint32_t) arg;
     xQueueSendFromISR(gpio_queue, &gpio_num, NULL);
 }
-
+ 
 static void gpio_task(void* arg)
 {
     uint32_t io_num;
@@ -71,16 +71,19 @@ static void gpio_task(void* arg)
             
             switch(io_num)
             {
-                case ( 1ULL << GPIO_INPUT_IO_21 ):
-                    gpio_set_level(GPIO_OUTPUT_PIN_SEL, 1);
+                case ( GPIO_INPUT_IO_21 ):
+                    gpio_set_level(GPIO_OUTPUT_IO_2, 1);
+                    ESP_LOGW(TAG_3, "LED Acesso!");
                     break;
 
-                case ( 1ULL << GPIO_INPUT_IO_22):
-                    gpio_set_level(GPIO_OUTPUT_PIN_SEL, 0);
+                case ( GPIO_INPUT_IO_22 ):
+                    gpio_set_level(GPIO_OUTPUT_IO_2, 0);
+                    ESP_LOGW(TAG_3, "LED Apagado!");
                     break;
                 
-                case ( 1ULL << GPIO_INPUT_IO_23):
-                    gpio_set_level(GPIO_OUTPUT_PIN_SEL, gpio_get_level(GPIO_OUTPUT_PIN_SEL) ? 1 : 0);
+                case ( GPIO_INPUT_IO_23 ):
+                    gpio_set_level(GPIO_OUTPUT_IO_2, gpio_get_level(GPIO_OUTPUT_IO_2) ? 0 : 1);
+                    ESP_LOGW(TAG_3, "Toggle do LED! | Estado: %s", gpio_get_level(GPIO_OUTPUT_IO_2) ? "ON" : "OFF");
                     break;
             }
         }
@@ -118,7 +121,10 @@ void app_main(void)
     gpio_config_t output_config = 
     {
         .pin_bit_mask = GPIO_OUTPUT_PIN_SEL,
-        .mode = GPIO_MODE_OUTPUT,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = 0,
+        .pull_down_en = 0,
+        .intr_type = GPIO_INTR_DISABLE
     };
 
     if(gpio_config(&input_config) != ESP_OK)
