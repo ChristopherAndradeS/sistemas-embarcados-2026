@@ -61,7 +61,7 @@ static bool IRAM_ATTR example_timer_on_alarm_cb_v3(gptimer_handle_t timer, const
     gptimer_set_alarm_action(timer, &alarm_config);
     // return whether we need to yield at the end of ISR
     return (high_task_awoken == pdTRUE);
-}
+}  
 
 void app_main(void)
 {
