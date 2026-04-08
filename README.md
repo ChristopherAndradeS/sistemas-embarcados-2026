@@ -7,3 +7,6 @@ Alunos:
 
 # Documentações:
 ### [Prática 1](https://github.com/ChristopherAndradeS/sistemas-embarcados-2026/blob/main/pratica-1/main/README.md)
+### [Prática 2](https://github.com/ChristopherAndradeS/sistemas-embarcados-2026/blob/main/pratica-2/main/README.md)
+### [Prática 3](https://github.com/ChristopherAndradeS/sistemas-embarcados-2026/blob/main/pratica-3/main/README.md)
+
