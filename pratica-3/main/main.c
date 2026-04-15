@@ -33,7 +33,6 @@ TickType_t delay_ms(int milisseconds);
 static QueueHandle_t gpio_queue = NULL;
 static QueueHandle_t timer_queue = NULL;
 
-
 const char gEspModelName[CHIP_POSIX_LINUX][32] = 
 {
     "INVALID_NAME_CHIP",
@@ -59,12 +58,23 @@ enum
     E_TIMER_INFO
 }
 
-uint64_t Timer[E_TIMER_INFO];
+typedef struct 
+{
+    uint64_t days;
+    uint64_t hours;
+    uint64_t minutes;
+    uint64_t seconds;
+    uint64_t milis;
+    uint64_t elapsed;
+} clock_t;
+
+clock_t Clock;
 
 static const char* TAG_1 = "[ PRATICA 1.1 ]";
 static const char* TAG_2 = "[ PRATICA 1.2 ]";
 static const char* TAG_3 = "[ PRATICA 2.0 ]";
 static const char* TAG_4 = "[ PRATICA 3.0 ]";
+static const char* TAG_5 = "[ RELÓGIO ]";
 
 static void IRAM_ATTR gpio_handle(void* arg)
 {
@@ -107,15 +117,17 @@ static void gpio_task(void* arg)
     }
 }
 
-static bool IRAM_ATTR OnSeconds(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
+static bool IRAM_ATTR OnSecondsUpdate(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
 {
     BaseType_t high_task_awoken = pdFALSE;
     QueueHandle_t queue = (QueueHandle_t)user_data;
 
+    uint64_t Timer[E_TIMER_INFO];
+
     Timer[E_TIMER_COUNT] = edata->count_value;
     Timer[E_TIMER_ALARM] = edata->alarm_value;
 
-    xQueueSendFromISR(queue, &Timer, high_task_awoken);
+    xQueueSendFromISR(queue, Timer, high_task_awoken);
 
     gptimer_alarm_config_t alarm_config = 
     {
@@ -140,7 +152,7 @@ static void timer_task(void* arg)
 
     gptimer_event_callbacks_t callback = 
     {
-        .on_alarm = OnSeconds,
+        .on_alarm = OnSecondsUpdate,
     };
     ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, callback, queue));
 
@@ -151,11 +163,21 @@ static void timer_task(void* arg)
     ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
     ESP_ERROR_CHECK(gptimer_start(gptimer));
 
+    uint64_t Timer[E_TIMER_INFO];
+    
     while(1)
     {
         if(xQueueReceive(queue, &Timer, pdMS_TO_TICKS(1500)))   
         {
-            // logica do relogio
+            Clock.elapsed = GetMilisFromMHz(Timer[E_TIMER_ALARM]);
+            Clock.days    = Clock.elapsed / (1000 * 60 * 60 * 24);
+            Clock.hour    = Clock.elapsed / (1000 * 60 * 60) % 24;
+            Clock.minutes = Clock.elapsed / (1000 * 60) % 60;
+            Clock.seconds = Clock.elapsed / (1000) % 60;
+            Clock.milis   = Clock.elapsed % (1000);
+
+            ESP_LOGI(TAG_5, "DIA: %02d | %02d:%02d:%02d:%04d", 
+                Clock.days, Clock.hour, Clock.minutes, Clock.seconds, Clock.milis);
         }
 
         else  
@@ -221,8 +243,8 @@ void app_main(void)
     gpio_isr_handler_add(GPIO_INPUT_IO_21, gpio_handle, (void*) GPIO_INPUT_IO_21);
     gpio_isr_handler_add(GPIO_INPUT_IO_22, gpio_handle, (void*) GPIO_INPUT_IO_22);
     gpio_isr_handler_add(GPIO_INPUT_IO_23, gpio_handle, (void*) GPIO_INPUT_IO_23);
-
-    timer_queue = xQueueCreate(10, sizeof(Timer));
+ 
+    timer_queue = xQueueCreate(10, sizeof(uint64_t) * E_TIMER_INFO);
     xTaskCreate(timer_task, "timer_task", 2048, NULL, 1, NULL);
 
     if(!queue) 
@@ -274,4 +296,9 @@ void app_main(void)
 TickType_t delay_ms(int milisseconds) 
 {
     return (milisseconds / portTICK_PERIOD_MS);
+}
+
+uint64_t GetMilisFromMHz(uint64_t MHz)
+{
+    return (uint32_t) (MHz / 100000) 
 }
