@@ -7,6 +7,8 @@
    CONDITIONS OF ANY KIND, either express or implied.
 */
 #include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "driver/ledc.h"
 #include "esp_err.h"
 
@@ -57,18 +59,20 @@ void app_main(void)
 
     while(1)
     {
-        for(int i = 0; i < 8192; i += 128)
+        for(int i = 0; i < 8192; i += 64)
         {   
             ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, i));
             // Update duty to apply the new value
             ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+            vTaskDelay((5 / portTICK_PERIOD_MS));
         }
 
-        for(int i = 8192; i >= 0; i -= 128)
+        for(int i = 8192; i >= 0; i -= 64)
         {   
             ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, i));
             // Update duty to apply the new value
             ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+            vTaskDelay((5 / portTICK_PERIOD_MS));
         }
     }
 }
