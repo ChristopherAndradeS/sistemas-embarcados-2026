@@ -39,8 +39,8 @@
 #define GPIO_INPUT_IO_23    (23)
 
 #define GPIO_OUTPUT_IO_16   (16)
-#define GPIO_OUTPUT_IO_17   (17)
-#define GPIO_OUTPUT_IO_26   (26)
+#define GPIO_OUTPUT_IO_17   (26)
+#define GPIO_OUTPUT_IO_26   (17)
 
 #define GPIO_OUTPUT_IO_32   (32)
 #define GPIO_OUTPUT_IO_33   (33)
