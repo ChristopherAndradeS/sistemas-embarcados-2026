@@ -1,4 +1,14 @@
 dependencies:
+  espressif/esp_lcd_sh1107:
+    component_hash: 04b223f56e8d5d784d8a14037911a327ba7a14cdb508ff63611d953122a14b17
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.2.0
   espressif/iqmath:
     component_hash: 39448db759b410373e543798167ca4670bbff3019cb290a2fe8e627221e71b9d
     dependencies:
@@ -27,9 +37,25 @@ dependencies:
     source:
       type: idf
     version: 5.5.1
+  lvgl/lvgl:
+    component_hash: 2409fdc84e9766d2a18afd84b051aef3f838348136cdb1c10ac2e8bcdb012bf6
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 9.2.0
+  protocol_examples_common:
+    dependencies: []
+    source:
+      path: C:\Users\sistemembarcados\esp\v5.5.1\esp-idf\examples\common_components\protocol_examples_common
+      type: local
+    version: '*'
 direct_dependencies:
+- espressif/esp_lcd_sh1107
 - espressif/pid_ctrl
 - idf
-manifest_hash: b9f2cb624300bc6ba3569c5b713edf3ac87f3be73e6c7eb100b1a4e819c7cbc9
+- lvgl/lvgl
+- protocol_examples_common
+manifest_hash: 4b72c459eadf6b1a97ca87bc95aadbf0d4b2f4637b764535ddc22f7ac6d8bd6c
 target: esp32
 version: 2.0.0
