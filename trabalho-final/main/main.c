@@ -33,6 +33,118 @@
 #include "nvs_flash.h"
 #include "protocol_examples_common.h"
 #include "mqtt_client.h"
+#include "pid_ctrl.h"
+
+#define GPIO_OUTPUT_IO_17   (26)
+#define GPIO_OUTPUT_IO_26   (17)
+
+#define PIN_SDA                 (19)
+#define PIN_SCL                 (18)
+#define PIN_NUM_RST             (-1)
+#define I2C_BUS_PORT            (0)
+#define I2C_HW_ADDR             (0x3C)
+#define LCD_PIXEL_CLOCK_HZ      (400 * 1000)
+#define LCD_CMD_BITS            (8)
+#define LCD_V_RES               (64)
+#define LCD_H_RES               (128)
+#define LVGL_PALETTE_SIZE       (8)
+#define LVGL_TASK_STACK_SIZE    (4 * 1024)
+#define LVGL_TASK_PRIORITY      (2)
+#define LVGL_TICK_PERIOD_MS     (5)
+#define LVGL_TASK_MAX_DELAY_MS  (500)
+#define LVGL_TASK_MIN_DELAY_MS  (1000 / CONFIG_FREERTOS_HZ)
+
+#define UPDATE_RATE_MS          (100)
+#define TIMER_RESOLUTION_HZ     (1000000)
+#define UPDATE_RATE_TICKS       ((TIMER_RESOLUTION_HZ / 1000) * UPDATE_RATE_MS)
+
+#define MIN_TEMPERATURE         (25.0f)
+#define MAX_TEMPERATURE         (100.0f)
+#define PID_OUTPUT_MIN         (0.0f)
+#define PID_OUTPUT_MAX         (100.0f)
+#define PWM_MAX_DUTY            (8191)
+#define COOLER_DEADBAND_C       (1.0f)
+#define COOLER_SCALE_PERCENT    (20.0f)
+
+static uint8_t oled_buffer[LCD_H_RES * LCD_V_RES / 8];
+static _lock_t lvgl_api_lock;
+
+static lv_obj_t *label_setpoint;
+static lv_obj_t *label_temperature;
+static lv_obj_t *label_speed;
+
+static QueueHandle_t timer_queue = NULL;
+static QueueHandle_t pwm_queue = NULL;
+static QueueHandle_t controller_queue = NULL;
+
+static SemaphoreHandle_t semaphore_adc = NULL; 
+
+typedef struct 
+{
+    uint64_t days;
+    uint64_t hours;
+    uint64_t minutes;
+    uint64_t seconds;
+    uint64_t milis;
+    uint64_t alarm_value;
+    uint64_t count_value;
+} cclock_t;
+
+typedef struct 
+{
+    uint16_t speed;
+    float temperature;
+    float setpoint;
+} sensor_data_t;
+
+typedef struct
+{
+    uint16_t cooler;
+    uint16_t heater;
+} duty_t;
+
+typedef struct
+{
+    float setpoint;
+    float temperature;
+    pid_ctrl_block_handle_f_t pid_handle;
+} controller_data_t;
+
+static controller_data_t farm_controller =
+{
+    .setpoint = 38.0f,
+    .temperature = 0.0f,
+    .pid_handle = NULL,
+};
+
+static float current_heater_percent = 0.0f;
+static float current_cooler_percent = 0.0f;
+
+static const char* TAG_FARM = "[ GRANJA ]";
+
+sensor_data_t farm_data;
+
+static bool IRAM_ATTR OnMilisUpdate(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
+{
+    BaseType_t high_task_awoken = pdFALSE;
+    QueueHandle_t queue = (QueueHandle_t)user_data;
+
+    gptimer_alarm_config_t alarm_config = 
+    {
+        .alarm_count = edata->alarm_value + UPDATE_RATE_TICKS,
+    };
+
+    gptimer_set_alarm_action(timer, &alarm_config);
+
+    cclock_t Clock;
+
+    Clock.alarm_value = edata->alarm_value;
+    Clock.count_value = edata->count_value;
+    
+    xQueueSendFromISR(queue, &Clock, &high_task_awoken);
+
+    return (high_task_awoken == pdTRUE);
+}
 
 static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t io_panel, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
@@ -61,15 +173,11 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
 
             uint8_t *buf = oled_buffer + hor_res * (y >> 3) + (x);
 
-            if (chroma_color) 
-            {
+            if(chroma_color) 
                 (*buf) &= ~(1 << (y % 8));
-            } 
-
+            
             else 
-            {
                 (*buf) |= (1 << (y % 8));
-            }
         }
     }
    
@@ -85,21 +193,55 @@ static void ui_create(lv_display_t *display)
 {
     lv_obj_t *scr = lv_display_get_screen_active(display);
 
-    label_clock = lv_label_create(scr);
-    lv_obj_align(label_clock, LV_ALIGN_TOP_MID, 0, 10);
+    label_setpoint = lv_label_create(scr);
+    lv_label_set_long_mode(label_setpoint, LV_LABEL_LONG_WRAP);
+    lv_obj_align(label_setpoint, LV_ALIGN_TOP_LEFT, 10, 10);
 
-    label_adc = lv_label_create(scr);
-    lv_obj_align(label_adc, LV_ALIGN_BOTTOM_MID, 0, 0);
+    label_temperature = lv_label_create(scr);
+    lv_label_set_long_mode(label_temperature, LV_LABEL_LONG_WRAP);
+    lv_obj_align(label_temperature, LV_ALIGN_TOP_MID, 0, 10);
+
+    label_speed = lv_label_create(scr);
+    lv_label_set_long_mode(label_speed, LV_LABEL_LONG_WRAP);
+    lv_obj_align(label_speed, LV_ALIGN_TOP_RIGHT, -10, 10);
 }
 
-static void ui_update(cclock_t Clock, int voltage)
+static void ui_update(sensor_data_t sensor_data)
 {
     _lock_acquire(&lvgl_api_lock);
 
-    //lv_label_set_text(label_clock, clock_text);
-    //(label_adc, adc_text);
+    char setpoint_buf[32];
+    char temperature_buf[32];
+    char fan_buf[32];
+
+    snprintf(setpoint_buf, sizeof(setpoint_buf), "SP: %.1f°C", sensor_data.setpoint);
+    snprintf(temperature_buf, sizeof(temperature_buf), "TMP: %.1f°C", sensor_data.temperature);
+    snprintf(fan_buf, sizeof(fan_buf), "FAN: %.0f%%", current_cooler_percent);
+
+    lv_label_set_text(label_setpoint, setpoint_buf);
+    lv_label_set_text(label_temperature, temperature_buf);
+    lv_label_set_text(label_speed, fan_buf);
 
     _lock_release(&lvgl_api_lock);
+}
+
+static float clampf(float value, float min, float max)
+{
+    if (value < min) return min;
+    if (value > max) return max;
+    return value;
+}
+
+static void update_setpoint(float new_setpoint)
+{
+    farm_controller.setpoint = clampf(new_setpoint, MIN_TEMPERATURE, MAX_TEMPERATURE);
+    farm_data.setpoint = farm_controller.setpoint;
+    ESP_LOGI(TAG_FARM, "Setpoint definido para %.1f°C", farm_controller.setpoint);
+}
+
+TickType_t delay_ms(int milisseconds) 
+{
+    return (milisseconds / portTICK_PERIOD_MS);
 }
 
 static void timer_task(void* arg)
@@ -110,7 +252,7 @@ static void timer_task(void* arg)
     
     if(!timer_queue) 
     {
-        ESP_LOGE(TAG_4, "ERRO: Não foi possível criar a fila corretamente.");
+        ESP_LOGE(TAG_FARM, "ERRO: Não foi possível criar a fila corretamente.");
         return;
     }
     
@@ -120,7 +262,7 @@ static void timer_task(void* arg)
     {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000, // 1MHz
+        .resolution_hz = TIMER_RESOLUTION_HZ,
     };
     ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
 
@@ -134,62 +276,22 @@ static void timer_task(void* arg)
     
     gptimer_alarm_config_t alarm_config = 
     {
-        .alarm_count = 100000, 
+        .alarm_count = UPDATE_RATE_TICKS, 
     };
     ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
     ESP_ERROR_CHECK(gptimer_start(gptimer));
-
-    adc_cali_handle_t adc_cali_handle = NULL;
-
-    adc_cali_line_fitting_config_t cali_config = 
-    {
-        .unit_id = ADC_UNIT_1,
-        .atten = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-                
-    ESP_ERROR_CHECK(adc_cali_create_scheme_line_fitting(&cali_config, &adc_cali_handle));
-    
-    int adc_raw;
-    int adc_cali;
 
     while(1)
     {
         if(xQueueReceive(timer_queue, &Clock, pdMS_TO_TICKS(1500)))   
         {
-            Clock.milis    = GetMilisFromMHz(Clock.alarm_value);
-            Clock.days     = Clock.milis / (1000 * 60 * 60 * 24);
-            Clock.hours    = Clock.milis / (1000 * 60 * 60) % 24;
-            Clock.minutes  = Clock.milis / (1000 * 60) % 60;
-            Clock.seconds  = Clock.milis / (1000) % 60;
-
-            ESP_LOGI(TAG_5, "Dias: %02llu | %02llu:%02llu:%02llu", 
-                    Clock.days, Clock.hours, Clock.minutes, Clock.seconds);
-            
-            xSemaphoreGive(semaphore_pwm);
             xSemaphoreGive(semaphore_adc);
-
-            if(xQueueReceive(adc_queue, &adc_raw, pdMS_TO_TICKS(10)))
-            {
-                if(!(Clock.alarm_value % 1000000))
-                {
-                    ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc_cali_handle, adc_raw, &adc_cali));
-                    ESP_LOGI(TAG_7, "adc_raw %d mV - adc_cali %d mV", adc_raw, adc_cali);
-
-                    ui_update(Clock, adc_cali);
-                }
-            }
         }
-        else  
-            ESP_LOGW(TAG_4, "Aviso: Contagem perdida!");
     }
 }
 
 static void pwm_task(void* arg)
 {
-    PWM_elements_t PWM;
-    uint32_t io_num;
-
     ledc_timer_config_t ledc_timer = 
     {
         .speed_mode       = LEDC_LOW_SPEED_MODE,
@@ -206,98 +308,43 @@ static void pwm_task(void* arg)
         .channel        = LEDC_CHANNEL_0,
         .timer_sel      = LEDC_TIMER_0,
         .intr_type      = LEDC_INTR_DISABLE,
-        .gpio_num       = GPIO_OUTPUT_IO_16,
+        .gpio_num       = GPIO_OUTPUT_IO_17,
         .duty           = 0,
         .hpoint         = 0
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_0));
 
-    ledc_channel_config_t ledc_channel_1 = {
+    ledc_channel_config_t ledc_channel_1 = 
+    {
         .speed_mode     = LEDC_LOW_SPEED_MODE,
         .channel        = LEDC_CHANNEL_1,
         .timer_sel      = LEDC_TIMER_0,
         .intr_type      = LEDC_INTR_DISABLE,
-        .gpio_num       = GPIO_OUTPUT_IO_33,
+        .gpio_num       = GPIO_OUTPUT_IO_26,
         .duty           = 0,
         .hpoint         = 0
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_1));
 
-    ledc_channel_config_t ledc_channel_2 = 
+    duty_t farm_duty;
+
+    pwm_queue = xQueueCreate(10, sizeof(duty_t));
+
+    if(pwm_queue == NULL) 
     {
-        .speed_mode     = LEDC_LOW_SPEED_MODE,
-        .channel        = LEDC_CHANNEL_2,
-        .timer_sel      = LEDC_TIMER_0,
-        .intr_type      = LEDC_INTR_DISABLE,
-        .gpio_num       = GPIO_OUTPUT_IO_17,
-        .duty           = 0,
-        .hpoint         = 0
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_2));
+        ESP_LOGE(TAG_FARM, "ERRO: Não foi possível criar a fila de PWM.");
+        return;
+    }
 
-    ledc_channel_config_t ledc_channel_3 = 
-    {
-        .speed_mode     = LEDC_LOW_SPEED_MODE,
-        .channel        = LEDC_CHANNEL_3,
-        .timer_sel      = LEDC_TIMER_0,
-        .intr_type      = LEDC_INTR_DISABLE,
-        .gpio_num       = GPIO_OUTPUT_IO_26, //vermelho
-        .duty           = 0,
-        .hpoint         = 0
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_3));
-    
-    pwm_queue = xQueueCreate(10, sizeof(uint32_t));
-
-    semaphore_pwm = xSemaphoreCreateBinary();
-
-    PWM.mode = false;
-    PWM.duty.pin1 = 0;
-    PWM.duty.pin2 = 0;
-    PWM.duty.pin3 = 0;
-    
     while(1)
     {
-        if(xQueueReceive(pwm_queue, &io_num, pdMS_TO_TICKS(10)))
+        if(xQueueReceive(pwm_queue, &farm_duty, pdMS_TO_TICKS(1500)))
         {
-            vTaskDelay(delay_ms(50));
-            
-            if(gpio_get_level(io_num)) continue;
-            
-            switch(io_num)
-            {
-                case ( GPIO_INPUT_IO_21 ):  
-                    PWM.mode = true;
-                break;
-
-                case ( GPIO_INPUT_IO_22 ):    
-                    PWM.mode = false;
-                    ESP_LOGW(TAG_6, "Modo: Manual | Duty: %d", PWM.duty.pin1);
-                    UpdatePWN(PWM.duty);
-                break;
-            
-                case ( GPIO_INPUT_IO_23 ):
-                    if(!PWM.mode)
-                    {
-                        PWM.duty.pin1 = (PWM.duty.pin1 >= 8192) ? 0 : PWM.duty.pin1 + PWM_AUTO_INCREMENT;
-                        
-                        ESP_LOGW(TAG_6, "Modo: Manual | Duty: %d", PWM.duty.pin1);
-                        UpdatePWN(PWM.duty);
-                    }
-                break;
-            }
-        }
-
-        if(xSemaphoreTake(semaphore_pwm, portMAX_DELAY) == pdTRUE)
-        {            
-            if(PWM.mode)
-            {
-                UpdatePWN(PWM.duty);
-            
-                PWM.duty.pin1 = (PWM.duty.pin1 >= 8192) ? 0 : PWM.duty.pin1 + PWM_AUTO_INCREMENT; 
-                ESP_LOGI(TAG_6, "Modo: Automático | Duty: %d", PWM.duty.pin1);
-            }
-        }
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, farm_duty.heater));
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0)); 
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, farm_duty.cooler));
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1));
+       }
     }
 }
 
@@ -308,7 +355,6 @@ static void adc_task(void* arg)
     {
         .unit_id = ADC_UNIT_1,
     };
-    
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle));
 
     adc_oneshot_chan_cfg_t config = 
@@ -318,9 +364,18 @@ static void adc_task(void* arg)
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_3, &config));
 
-    int adc_raw;
+    adc_cali_handle_t adc_cali_handle = NULL;
 
-    adc_queue = xQueueCreate(10, sizeof(int));
+    adc_cali_line_fitting_config_t cali_config = 
+    {
+        .unit_id = ADC_UNIT_1,
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+                
+    ESP_ERROR_CHECK(adc_cali_create_scheme_line_fitting(&cali_config, &adc_cali_handle));
+    
+    int adc_raw, adc_cali;
 
     semaphore_adc = xSemaphoreCreateBinary();
 
@@ -329,11 +384,20 @@ static void adc_task(void* arg)
         if(xSemaphoreTake(semaphore_adc, portMAX_DELAY) == pdTRUE)
         {   
             ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL_3, &adc_raw));
-     
-            xQueueSendFromISR(adc_queue, &adc_raw, NULL);
+  
+            ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc_cali_handle, adc_raw, &adc_cali));
+
+            float measured_temp = adc_cali / 10.0f; // LM35: 10 mV / °C
+            ESP_LOGI(TAG_FARM, "adc_raw %d mV - adc_cali %d mV - temp %.1f°C", adc_raw, adc_cali, measured_temp);
+            
+            farm_data.temperature = measured_temp;
+            farm_data.setpoint = farm_controller.setpoint;
+
+            xQueueSend(controller_queue, &measured_temp, pdMS_TO_TICKS(10));
+            
+            ui_update(farm_data);
         }
    }
-    
 }
 
 static void lvgl_port_task(void *arg)
@@ -398,7 +462,7 @@ static void display_task(void *arg)
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 
-    ESP_LOGI(TAG_8, "Inicializando lib LVGL...");
+    ESP_LOGI(TAG_FARM, "Inicializando lib LVGL...");
     lv_init();
 
     /* CRIAÇÃO DO DISPLAY */
@@ -444,33 +508,177 @@ static void display_task(void *arg)
     }
 }
 
-TickType_t delay_ms(int milisseconds) 
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
-    return (milisseconds / portTICK_PERIOD_MS);
-}
-   
-#define GPIO_OUTPUT_PIN_SEL ( 1ULL << 17 )
+    esp_mqtt_event_handle_t  event  = event_data;
+    esp_mqtt_client_handle_t client = event->client;
 
-void app_main(void)
-{
-    gpio_config_t output_config = 
+    switch((esp_mqtt_event_id_t)event_id) 
     {
-        .pin_bit_mask = GPIO_OUTPUT_PIN_SEL,
-        .mode = GPIO_MODE_INPUT_OUTPUT,
-        .pull_up_en = 0,
-        .pull_down_en = 0,
-        .intr_type = GPIO_INTR_DISABLE
-    };
+        case MQTT_EVENT_CONNECTED:
 
-    if(gpio_config(&output_config) != ESP_OK)
-        ESP_LOGE("[ ]", "ERRO: Não foi possível configurar gpio's!\n");    
-    else
-        ESP_LOGI("[ ]", "GPIO INPUT: Configuração realizada com sucesso.");
+            ESP_LOGI(TAG_FARM, "ESP se conectou com sucesso");   
+            esp_mqtt_client_subscribe(client, "/topic/farm_setpoint", 0);
 
-    while(1)
-    {
-        gpio_set_level(17, gpio_get_level(17) ? 0 : 1);
-        vTaskDelay(delay_ms(15000));
+            break;
+
+        case MQTT_EVENT_DISCONNECTED:
+            break;
+
+        case MQTT_EVENT_SUBSCRIBED:
+
+            ESP_LOGI(TAG_FARM, "ESP se inscreveu num tópico");   
+
+            break;
+
+        case MQTT_EVENT_UNSUBSCRIBED:
+            break;
+
+        case MQTT_EVENT_PUBLISHED:
+            break;
+
+        case MQTT_EVENT_DATA:
+        {
+            const char *topic = "/topic/farm_setpoint";
+            size_t topic_len = strlen(topic);
+
+            if ((size_t)event->topic_len == topic_len && strncmp(event->topic, topic, topic_len) == 0)
+            {
+                char value_buf[32] = {0};
+                size_t len = event->data_len;
+
+                if(len >= sizeof(value_buf))
+                    len = sizeof(value_buf) - 1;
+                
+                memcpy(value_buf, event->data, len);
+                value_buf[len] = '\0';
+
+                float new_setpoint = strtof(value_buf, NULL);
+                if (new_setpoint >= MIN_TEMPERATURE && new_setpoint <= MAX_TEMPERATURE)
+                    update_setpoint(new_setpoint);
+                else
+                    ESP_LOGW(TAG_FARM, "Setpoint MQTT fora do intervalo: %s", value_buf);
+            }
+            break;
+        }
+
+        case MQTT_EVENT_ERROR:
+
+            ESP_LOGE(TAG_FARM, "ERRO: Um erro aconteceu!");
+
+            if(event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) 
+            {
+                ESP_LOGE(TAG_FARM, "Reportado por esp_tls_last_esp_err: %d", event->error_handle->esp_tls_last_esp_err);
+                ESP_LOGE(TAG_FARM, "Reportado por esp_tls_stack_err: %d", event->error_handle->esp_tls_stack_err);
+                ESP_LOGE(TAG_FARM, "Reportado por esp_transport_sock_errno: %d", event->error_handle->esp_transport_sock_errno);
+                ESP_LOGE(TAG_FARM, "Erro string: (%s)", strerror(event->error_handle->esp_transport_sock_errno));
+            }
+
+            break;
+        
+        default:
+
+            ESP_LOGI(TAG_FARM, "???: Um evento desconhecido foi executado! event_id: %d", event->event_id);
+        
+        break;
     }
 }
 
+static void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = 
+    {
+        .broker.address.uri = "mqtt://g1device:g1device@node02.myqtthub.com:1883",
+        .credentials.client_id = "g1device",
+    };
+
+    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(client);
+}
+
+static void controller_task(void* arg)
+{
+    controller_queue = xQueueCreate(10, sizeof(float));
+
+    if(controller_queue == NULL) 
+    {
+        ESP_LOGE(TAG_FARM, "ERRO: Não foi possível criar a fila do controlador.");
+        return;
+    }
+
+    update_setpoint(farm_controller.setpoint);
+
+    pid_ctrl_config_f_t pid_config = 
+    {
+        .init_param = 
+        {
+            .kp = 5.0f,
+            .ki = 0.3f,
+            .kd = 0.0f,
+            .max_output = PID_OUTPUT_MAX,
+            .min_output = PID_OUTPUT_MIN,
+            .max_integral = 50.0f,
+            .min_integral = -50.0f,
+            .cal_type = PID_CAL_TYPE_POSITIONAL,
+        },
+    };
+    ESP_ERROR_CHECK(pid_new_control_block_f(&pid_config, &farm_controller.pid_handle));
+
+    float measured_temp = 0.0f;
+    duty_t next_duty = {0};
+
+    while(1) 
+    {
+        if(xQueueReceive(controller_queue, &measured_temp, pdMS_TO_TICKS(UPDATE_RATE_MS * 2)))
+        {
+            farm_controller.temperature = measured_temp;
+            float error = farm_controller.setpoint - measured_temp;
+            float pid_output = 0.0f;
+
+            ESP_ERROR_CHECK(pid_compute(farm_controller.pid_handle, error, &pid_output));
+            float heater_pct = clampf(pid_output, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+            float cooler_pct = 0.0f;
+
+            if(measured_temp > farm_controller.setpoint + COOLER_DEADBAND_C) 
+            {
+                cooler_pct = clampf((measured_temp - farm_controller.setpoint) * COOLER_SCALE_PERCENT, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+            }
+
+            current_heater_percent = heater_pct;
+            current_cooler_percent = cooler_pct;
+
+            next_duty.heater = (uint16_t)((heater_pct / 100.0f) * PWM_MAX_DUTY + 0.5f);
+            next_duty.cooler = (uint16_t)((cooler_pct / 100.0f) * PWM_MAX_DUTY + 0.5f);
+
+            xQueueSend(pwm_queue, &next_duty, pdMS_TO_TICKS(10));
+        }
+    }
+}
+
+void app_main(void)
+{
+    xTaskCreate(timer_task, "timer_task", 2048, NULL, 1, NULL);
+    
+    xTaskCreate(controller_task, "controller_task", 2048, NULL, 2, NULL);
+
+    xTaskCreate(pwm_task, "pwm_task", 2048, NULL, 1, NULL);
+
+    xTaskCreate(adc_task, "adc_task", 4096, NULL, 1, NULL);
+
+    xTaskCreate(display_task, "display_task", 4096, NULL, 1, NULL);
+    
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    ESP_ERROR_CHECK(example_connect());
+
+    mqtt_app_start();
+
+    while(1)
+    {
+        vTaskDelay(delay_ms(15000));
+    }
+}
