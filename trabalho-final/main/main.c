@@ -60,11 +60,12 @@
 
 #define MIN_TEMPERATURE         (25.0f)
 #define MAX_TEMPERATURE         (100.0f)
-#define PID_OUTPUT_MIN         (0.0f)
-#define PID_OUTPUT_MAX         (100.0f)
-#define PWM_MAX_DUTY            (8191)
-#define COOLER_DEADBAND_C       (1.0f)
-#define COOLER_SCALE_PERCENT    (20.0f)
+#define PID_OUTPUT_MIN          (0.0f)
+#define PID_OUTPUT_MAX          (100.0f)
+#define PWM_MAX_DUTY            (8192)
+
+#define COOLER_DEADBAND_C       (0.0f)
+#define COOLER_SCALE_PERCENT    (100.0f)
 
 static uint8_t oled_buffer[LCD_H_RES * LCD_V_RES / 8];
 static _lock_t lvgl_api_lock;
@@ -92,7 +93,8 @@ typedef struct
 
 typedef struct 
 {
-    uint16_t speed;
+    float speed;
+    float heat;
     float temperature;
     float setpoint;
 } sensor_data_t;
@@ -116,9 +118,6 @@ static controller_data_t farm_controller =
     .temperature = 0.0f,
     .pid_handle = NULL,
 };
-
-static float current_heater_percent = 0.0f;
-static float current_cooler_percent = 0.0f;
 
 static const char* TAG_FARM = "[ GRANJA ]";
 
@@ -194,16 +193,16 @@ static void ui_create(lv_display_t *display)
     lv_obj_t *scr = lv_display_get_screen_active(display);
 
     label_setpoint = lv_label_create(scr);
-    lv_label_set_long_mode(label_setpoint, LV_LABEL_LONG_WRAP);
-    lv_obj_align(label_setpoint, LV_ALIGN_TOP_LEFT, 10, 10);
+    //lv_label_set_long_mode(label_setpoint, LV_LABEL_LONG_WRAP);
+    lv_obj_align(label_setpoint, LV_ALIGN_CENTER, 0, -20);
 
     label_temperature = lv_label_create(scr);
-    lv_label_set_long_mode(label_temperature, LV_LABEL_LONG_WRAP);
-    lv_obj_align(label_temperature, LV_ALIGN_TOP_MID, 0, 10);
+    //lv_label_set_long_mode(label_temperature, LV_LABEL_LONG_WRAP);
+    lv_obj_align(label_temperature, LV_ALIGN_CENTER, 0, 0);
 
     label_speed = lv_label_create(scr);
-    lv_label_set_long_mode(label_speed, LV_LABEL_LONG_WRAP);
-    lv_obj_align(label_speed, LV_ALIGN_TOP_RIGHT, -10, 10);
+    //lv_label_set_long_mode(label_speed, LV_LABEL_LONG_WRAP);
+    lv_obj_align(label_speed, LV_ALIGN_CENTER, 0, 21);
 }
 
 static void ui_update(sensor_data_t sensor_data)
@@ -216,7 +215,7 @@ static void ui_update(sensor_data_t sensor_data)
 
     snprintf(setpoint_buf, sizeof(setpoint_buf), "SP: %.1f°C", sensor_data.setpoint);
     snprintf(temperature_buf, sizeof(temperature_buf), "TMP: %.1f°C", sensor_data.temperature);
-    snprintf(fan_buf, sizeof(fan_buf), "FAN: %.0f%%", current_cooler_percent);
+    snprintf(fan_buf, sizeof(fan_buf), "HT: %0.f%% FAN: %.0f%%", sensor_data.heat, sensor_data.speed);
 
     lv_label_set_text(label_setpoint, setpoint_buf);
     lv_label_set_text(label_temperature, temperature_buf);
@@ -340,6 +339,8 @@ static void pwm_task(void* arg)
     {
         if(xQueueReceive(pwm_queue, &farm_duty, pdMS_TO_TICKS(1500)))
         {
+            ESP_LOGI(TAG_FARM, "pwm heater: %d | pwm fan: %d", farm_duty.heater, farm_duty.cooler);
+
             ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, farm_duty.heater));
             ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0)); 
             ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, farm_duty.cooler));
@@ -394,8 +395,6 @@ static void adc_task(void* arg)
             farm_data.setpoint = farm_controller.setpoint;
 
             xQueueSend(controller_queue, &measured_temp, pdMS_TO_TICKS(10));
-            
-            ui_update(farm_data);
         }
    }
 }
@@ -504,6 +503,7 @@ static void display_task(void *arg)
 
     while (1) 
     {
+        ui_update(farm_data);
         vTaskDelay(delay_ms(250));
     }
 }
@@ -539,26 +539,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
         case MQTT_EVENT_DATA:
         {
-            const char *topic = "/topic/farm_setpoint";
-            size_t topic_len = strlen(topic);
+            ESP_LOGW(TAG_FARM, "MQTT -> DATA : %s", event->data);
 
-            if ((size_t)event->topic_len == topic_len && strncmp(event->topic, topic, topic_len) == 0)
+            float new_setpoint = strtof(event->data, NULL);
+            if (new_setpoint >= MIN_TEMPERATURE && new_setpoint <= MAX_TEMPERATURE)
             {
-                char value_buf[32] = {0};
-                size_t len = event->data_len;
-
-                if(len >= sizeof(value_buf))
-                    len = sizeof(value_buf) - 1;
-                
-                memcpy(value_buf, event->data, len);
-                value_buf[len] = '\0';
-
-                float new_setpoint = strtof(value_buf, NULL);
-                if (new_setpoint >= MIN_TEMPERATURE && new_setpoint <= MAX_TEMPERATURE)
-                    update_setpoint(new_setpoint);
-                else
-                    ESP_LOGW(TAG_FARM, "Setpoint MQTT fora do intervalo: %s", value_buf);
+                update_setpoint(new_setpoint);
+                ESP_LOGW(TAG_FARM, "Setpoint Alterado para: %0.1f °C", new_setpoint);
             }
+            else
+                ESP_LOGW(TAG_FARM, "Setpoint MQTT fora do intervalo: %0.1f °C", new_setpoint);
+    
             break;
         }
 
@@ -608,14 +599,14 @@ static void controller_task(void* arg)
         return;
     }
 
-    update_setpoint(farm_controller.setpoint);
+    update_setpoint(38.0f);
 
     pid_ctrl_config_f_t pid_config = 
     {
         .init_param = 
         {
-            .kp = 5.0f,
-            .ki = 0.3f,
+            .kp = 2.5f,
+            .ki = 0.8f,
             .kd = 0.0f,
             .max_output = PID_OUTPUT_MAX,
             .min_output = PID_OUTPUT_MIN,
@@ -646,12 +637,12 @@ static void controller_task(void* arg)
                 cooler_pct = clampf((measured_temp - farm_controller.setpoint) * COOLER_SCALE_PERCENT, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
             }
 
-            current_heater_percent = heater_pct;
-            current_cooler_percent = cooler_pct;
+            next_duty.heater = (uint16_t)((heater_pct / 100.0f) * PWM_MAX_DUTY);
+            next_duty.cooler = (uint16_t)((cooler_pct / 100.0f) * PWM_MAX_DUTY);
 
-            next_duty.heater = (uint16_t)((heater_pct / 100.0f) * PWM_MAX_DUTY + 0.5f);
-            next_duty.cooler = (uint16_t)((cooler_pct / 100.0f) * PWM_MAX_DUTY + 0.5f);
-
+            farm_data.speed = cooler_pct;
+            farm_data.heat = heater_pct;
+ 
             xQueueSend(pwm_queue, &next_duty, pdMS_TO_TICKS(10));
         }
     }
@@ -669,6 +660,8 @@ void app_main(void)
 
     xTaskCreate(display_task, "display_task", 4096, NULL, 1, NULL);
     
+    esp_log_level_set(TAG_FARM, ESP_LOG_WARN);
+
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -679,6 +672,6 @@ void app_main(void)
 
     while(1)
     {
-        vTaskDelay(delay_ms(15000));
+        vTaskDelay(delay_ms(1000));
     }
 }
