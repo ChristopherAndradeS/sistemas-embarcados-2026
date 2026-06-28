@@ -1,8 +1,6 @@
 #include <stdio.h>
-#include <inttypes.h>
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <sys/lock.h>
 #include <sys/param.h>
 #include "sdkconfig.h"
@@ -10,10 +8,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_idf_version.h"
-#include "esp_chip_info.h"
 #include "esp_log.h"
-#include "esp_flash.h"
-#include "esp_system.h"
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
@@ -35,6 +30,7 @@
 #include "mqtt_client.h"
 #include "pid_ctrl.h"
 
+#define GPIO_LED_BUILDIN    (2)
 #define GPIO_OUTPUT_IO_17   (26)
 #define GPIO_OUTPUT_IO_26   (17)
 
@@ -63,9 +59,6 @@
 #define PID_OUTPUT_MIN          (0.0f)
 #define PID_OUTPUT_MAX          (100.0f)
 #define PWM_MAX_DUTY            (8192)
-
-#define COOLER_DEADBAND_C       (0.0f)
-#define COOLER_SCALE_PERCENT    (100.0f)
 
 static uint8_t oled_buffer[LCD_H_RES * LCD_V_RES / 8];
 static _lock_t lvgl_api_lock;
@@ -384,6 +377,8 @@ static void adc_task(void* arg)
     {
         if(xSemaphoreTake(semaphore_adc, portMAX_DELAY) == pdTRUE)
         {   
+            gpio_set_level(GPIO_LED_BUILDIN, 1);
+
             ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL_3, &adc_raw));
   
             ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc_cali_handle, adc_raw, &adc_cali));
@@ -624,32 +619,52 @@ static void controller_task(void* arg)
     {
         if(xQueueReceive(controller_queue, &measured_temp, pdMS_TO_TICKS(UPDATE_RATE_MS * 2)))
         {
+            gpio_set_level(GPIO_LED_BUILDIN, 0);
+
             farm_controller.temperature = measured_temp;
             float error = farm_controller.setpoint - measured_temp;
             float pid_output = 0.0f;
 
-            ESP_ERROR_CHECK(pid_compute(farm_controller.pid_handle, error, &pid_output));
-            float heater_pct = clampf(pid_output, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
-            float cooler_pct = 0.0f;
+            ESP_ERROR_CHECK(pid_compute(farm_controller.pid_handle, error, &pid_output)); 
 
-            if(measured_temp > farm_controller.setpoint + COOLER_DEADBAND_C) 
+            float heater_pct = 0.0f;
+            float cooler_pct = 0.0f;
+            float control_signal = clampf(pid_output, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+
+            #define CONTROL_BAND_C 2.5f
+
+            if (error > CONTROL_BAND_C) 
             {
-                cooler_pct = clampf((measured_temp - farm_controller.setpoint) * COOLER_SCALE_PERCENT, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+                heater_pct = 100.0f;
+                cooler_pct = 0.0f;
+            } 
+            else if (error < -CONTROL_BAND_C) 
+            {
+                heater_pct = 0.0f;
+                cooler_pct = 100.0f;
+            } 
+            else 
+            {
+                heater_pct = control_signal;
+                cooler_pct = 100.0f - heater_pct; 
             }
 
-            next_duty.heater = (uint16_t)((heater_pct / 100.0f) * PWM_MAX_DUTY);
-            next_duty.cooler = (uint16_t)((cooler_pct / 100.0f) * PWM_MAX_DUTY);
+            next_duty.heater = (uint16_t)((heater_pct / 100.0f) * PWM_MAX_DUTY); 
+            next_duty.cooler = (uint16_t)((cooler_pct / 100.0f) * PWM_MAX_DUTY); 
 
-            farm_data.speed = cooler_pct;
-            farm_data.heat = heater_pct;
- 
-            xQueueSend(pwm_queue, &next_duty, pdMS_TO_TICKS(10));
+            farm_data.speed = cooler_pct; 
+            farm_data.heat  = heater_pct;
+
+            xQueueSend(pwm_queue, &next_duty, pdMS_TO_TICKS(10)); 
         }
     }
 }
 
 void app_main(void)
 {
+    gpio_reset_pin(GPIO_LED_BUILDIN);
+    gpio_set_direction(GPIO_LED_BUILDIN, GPIO_MODE_OUTPUT);
+
     xTaskCreate(timer_task, "timer_task", 2048, NULL, 1, NULL);
     
     xTaskCreate(controller_task, "controller_task", 2048, NULL, 2, NULL);
