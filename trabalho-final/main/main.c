@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
 #include <sys/lock.h>
@@ -600,8 +601,8 @@ static void controller_task(void* arg)
     {
         .init_param = 
         {
-            .kp = 2.5f,
-            .ki = 0.8f,
+            .kp = 15.5f,
+            .ki = 1.5f,
             .kd = 0.0f,
             .max_output = PID_OUTPUT_MAX,
             .min_output = PID_OUTPUT_MIN,
@@ -631,7 +632,7 @@ static void controller_task(void* arg)
             float cooler_pct = 0.0f;
             float control_signal = clampf(pid_output, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
 
-            #define CONTROL_BAND_C 2.5f
+            #define CONTROL_BAND_C 1.0f
 
             if (error > CONTROL_BAND_C) 
             {
@@ -646,7 +647,8 @@ static void controller_task(void* arg)
             else 
             {
                 heater_pct = control_signal;
-                cooler_pct = 100.0f - heater_pct; 
+                cooler_pct = (100.0f - heater_pct) * 0.175;
+                cooler_pct = (cooler_pct < 20.0f) ? 0.0 : cooler_pct; 
             }
 
             next_duty.heater = (uint16_t)((heater_pct / 100.0f) * PWM_MAX_DUTY); 
